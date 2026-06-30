@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aqara.adapter-18090</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/admin/.workbuddy/binaries/python/versions/3.13.12/bin/python3</string>
+        <string>/Users/admin/WorkBuddy/2026-05-18-task-8/aqara-api-adapter.py</string>
+        <string>--port</string>
+        <string>18090</string>
+        <string>--api-key</string>
+        <string>sk-f12208bbc17b18dfb36e083c08e07ed258e37522841422f1a5a67a0a426fc910</string>
+        <string>--log</string>
+        <string>/tmp/.adapter-18090.log</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/.adapter-18090-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/.adapter-18090-stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
