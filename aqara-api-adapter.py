@@ -102,12 +102,14 @@ def curl_call(body_json, api_key, backend_url, stream=False, timeout=300):
         "-X", "POST",
         "-H", f"Authorization: Bearer {api_key}",
         "-H", "Content-Type: application/json",
-        "-d", body_json,
+        "-d", "@-",  # 从 stdin 读取，避免 ARG_MAX 限制
     ]
     cmd += ["-N", "--no-buffer"]
     cmd.append(f"{backend_url}/chat/completions")
 
-    p = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
+    p = subprocess.run(
+        cmd, capture_output=True, input=body_json.encode(), timeout=timeout + 10
+    )
     return p.returncode, p.stdout, p.stderr
 
 
@@ -120,11 +122,15 @@ def curl_stream(body_json, api_key, backend_url, timeout=300):
         "-X", "POST",
         "-H", f"Authorization: Bearer {api_key}",
         "-H", "Content-Type: application/json",
-        "-d", body_json,
+        "-d", "@-",  # 从 stdin 读取，避免 ARG_MAX 限制
         f"{backend_url}/chat/completions"
     ]
     log(f"  curl-stream: {len(body_json)} bytes, timeout={timeout}s")
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE
+    )
+    p.stdin.write(body_json.encode())
+    p.stdin.close()
 
     leftover = b""
     while True:
