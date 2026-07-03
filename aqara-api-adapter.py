@@ -299,6 +299,21 @@ def convert_openai_to_anthropic(openai_data):
             "input": json.loads(func.get("arguments", "{}")),
         })
 
+    # ── 空回复兜底 ──
+    # choices 存在但 content 为空（无文本、无工具调用），注入警告
+    if not content:
+        content.append({
+            "type": "text",
+            "text": (
+                "\u26a0\ufe0f [Adapter] The backend model returned empty content.\n\n"
+                "Possible causes:\n"
+                "1. Conversation context too long, exceeding model context window\n"
+                "2. Model unable to process this request\n"
+                "3. Backend service temporary error\n\n"
+                "Suggestion: Start a new conversation window, or simplify the context and retry."
+            ),
+        })
+
     return {
         "id": msg_id, "type": "message", "role": "assistant",
         "content": content,
@@ -606,10 +621,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         result = convert_openai_to_anthropic(data)
         content = result.get("content", [])
         tc = sum(1 for b in content if b.get("type") == "tool_use")
-        log(
-            f"  << OK {sum(len(b.get('text','')) for b in content if b.get('type')=='text')} "
-            f"chars + {tc} tool_uses"
-        )
+        text_chars = sum(len(b.get("text", "")) for b in content if b.get("type") == "text")
+
+        # ── 空回复检测 ──
+        if text_chars == 0 and tc == 0:
+            warn_text = (
+                "\u26a0\ufe0f [Adapter] The backend model returned empty content.\n\n"
+                "Possible causes:\n"
+                "1. Conversation context too long, exceeding model context window\n"
+                "2. Model unable to process this request\n"
+                "3. Backend service temporary error\n\n"
+                "Suggestion: Start a new conversation window, or simplify the context and retry."
+            )
+            result["content"] = [{"type": "text", "text": warn_text}]
+            log(f"  << OK 0 chars + 0 tool_uses  (EMPTY REPLY: injected warning)")
+        else:
+            log(f"  << OK {text_chars} chars + {tc} tool_uses")
+
         self._send_json(200, result)
 
     def _anthro_sse(self, event_type, data):
@@ -769,6 +797,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         close_block()
 
+        # ── 空回复检测 ──
+        # 后端返回空内容时，注入可见警告，避免 Claude Desktop 静默卡住
+        if total_text == 0 and len(tool_calls_acc) == 0:
+            warn_text = (
+                "\u26a0\ufe0f [Adapter] The backend model returned empty content.\n\n"
+                "Possible causes:\n"
+                "1. Conversation context too long, exceeding model context window\n"
+                "2. Model unable to process this request\n"
+                "3. Backend service temporary error\n\n"
+                "Suggestion: Start a new conversation window, or simplify the context and retry."
+            )
+            self._anthro_sse("content_block_start", {
+                "type": "content_block_start",
+                "index": block_idx,
+                "content_block": {"type": "text", "text": ""},
+            })
+            self._anthro_sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": block_idx,
+                "delta": {"type": "text_delta", "text": warn_text},
+            })
+            self.wfile.flush()
+            self._anthro_sse("content_block_stop", {
+                "type": "content_block_stop",
+                "index": block_idx,
+            })
+            self.wfile.flush()
+            total_text = len(warn_text)
+            log(f"  !! EMPTY REPLY detected: injected warning ({len(warn_text)} chars)")
+
         # message_delta + message_stop
         stop_map = {
             "stop": "end_turn", "length": "max_tokens",
@@ -796,7 +854,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise Exception(f"curl exit={code}")
         chat_data = json.loads(out)
         resp_data = convert_chat_to_responses(chat_data, model)
-        log("  << [responses] OK")
+
+        # ── 空回复检测 ──
+        out_items = resp_data.get("output", [])
+        out_text = ""
+        for item in out_items:
+            for part in item.get("content", []):
+                out_text += part.get("text", "")
+        if not out_text:
+            warn_text = (
+                "\u26a0\ufe0f [Adapter] The backend model returned empty content.\n\n"
+                "Possible causes:\n"
+                "1. Conversation context too long, exceeding model context window\n"
+                "2. Model unable to process this request\n"
+                "3. Backend service temporary error\n\n"
+                "Suggestion: Start a new conversation window, or simplify the context and retry."
+            )
+            resp_data["output"] = [{
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": warn_text}],
+            }]
+            log("  << [responses] OK (EMPTY REPLY: injected warning)")
+        else:
+            log("  << [responses] OK")
+
         self._send_json(200, resp_data)
 
     def _send_responses_stream(self, body_json, model):
@@ -910,6 +991,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"  << [responses stream] chunks={chunk_count} skipped={skip_count} "
             f"text={len(total_text)} chars tools={has_tool_call}"
         )
+
+        # ── 空回复检测 ──
+        if not total_text and not has_tool_call:
+            warn_text = (
+                "\u26a0\ufe0f [Adapter] The backend model returned empty content.\n\n"
+                "Possible causes:\n"
+                "1. Conversation context too long, exceeding model context window\n"
+                "2. Model unable to process this request\n"
+                "3. Backend service temporary error\n\n"
+                "Suggestion: Start a new conversation window, or simplify the context and retry."
+            )
+            warn_event = {
+                "type": "response.output_text.delta",
+                "item_id": msg_item_id, "output_index": 0,
+                "content_index": 0, "delta": warn_text,
+            }
+            self.wfile.write(f"data: {json.dumps(warn_event)}\n\n".encode())
+            self.wfile.flush()
+            total_text = warn_text
+            log(f"  !! [responses stream] EMPTY REPLY: injected warning ({len(warn_text)} chars)")
 
         # ④ 收尾事件
         if has_tool_call:
