@@ -267,6 +267,31 @@ def convert_openai_to_anthropic(openai_data):
     """OpenAI Chat Completions 响应 → Anthropic Messages 响应"""
     msg_id = openai_data.get("id", "")
     model = openai_data.get("model", "")
+
+    # ── 后端错误检测 ──
+    if openai_data.get("error"):
+        err_msg = openai_data["error"]
+        if isinstance(err_msg, dict):
+            err_text = err_msg.get("message", str(err_msg))
+            err_type = err_msg.get("type", "")
+        else:
+            err_text = str(err_msg)
+            err_type = ""
+        log(f"  !! Backend error: type={err_type} msg={err_text[:200]}")
+        return {
+            "id": msg_id, "type": "message", "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": f"\u26a0\ufe0f [Adapter] Backend returned an error.\n\n"
+                        f"Error type: {err_type}\n"
+                        f"Error message: {err_text}\n\n"
+                        f"This is a backend service issue, not a context length problem.\n"
+                        f"Try switching to another model (e.g. claude-sonnet-4-6, claude-opus-4-6, gpt-5.2).",
+            }],
+            "model": model, "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+
     if not openai_data.get("choices"):
         return {
             "id": msg_id, "type": "message", "role": "assistant",
@@ -616,8 +641,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _send_anthropic_sync(self, body_json, model):
         code, out, err = curl_call(body_json, self.api_key, self.backend_url, stream=False)
         if code != 0:
-            raise Exception(f"curl exit={code}: {err.decode(errors='replace')[:300]}")
-        data = json.loads(out)
+            err_text = err.decode(errors="replace")[:300] if err else "unknown"
+            # curl 超时（exit=28）或连接失败 → 直接返回明确错误
+            if code == 28:
+                raise Exception(f"Backend timeout: model {model} did not respond within timeout")
+            raise Exception(f"curl exit={code}: {err_text}")
+
+        # 后端返回空内容（curl 成功但 stdout 为空）
+        if not out or not out.strip():
+            log(f"  !! Backend returned empty response (0 bytes)")
+            self._send_json(200, {
+                "id": "msg_err", "type": "message", "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": f"\u26a0\ufe0f [Adapter] Backend returned an empty response for model `{model}`.\n\n"
+                            f"This usually means the model service is down or overloaded.\n"
+                            f"Try switching to: claude-sonnet-4-6, claude-opus-4-6, or gpt-5.2.",
+                }],
+                "model": model, "stop_reason": "end_turn", "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            })
+            return
+
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            log(f"  !! Backend returned non-JSON: {out[:200].decode(errors='replace')}")
+            self._send_json(200, {
+                "id": "msg_err", "type": "message", "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": f"\u26a0\ufe0f [Adapter] Backend returned invalid JSON for model `{model}`.\n\n"
+                            f"Raw response: {out[:300].decode(errors='replace')}\n\n"
+                            f"Try switching to another model.",
+                }],
+                "model": model, "stop_reason": "end_turn", "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            })
+            return
+
         result = convert_openai_to_anthropic(data)
         content = result.get("content", [])
         tc = sum(1 for b in content if b.get("type") == "tool_use")
@@ -698,6 +760,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     continue
                 try:
                     cd = json.loads(line_data)
+                    # ── 后端错误检测（Anthropic 流式） ──
+                    if cd.get("error"):
+                        err_msg = cd["error"]
+                        if isinstance(err_msg, dict):
+                            err_text = err_msg.get("message", str(err_msg))
+                            err_type = err_msg.get("type", "")
+                        else:
+                            err_text = str(err_msg)
+                            err_type = ""
+                        log(f"  !! Backend error in stream: type={err_type} msg={err_text[:200]}")
+                        if not block_open:
+                            block_open = True
+                            block_type = "text"
+                            self._anthro_sse("content_block_start", {
+                                "type": "content_block_start",
+                                "index": block_idx,
+                                "content_block": {"type": "text", "text": ""},
+                            })
+                            self.wfile.flush()
+                        err_display = (
+                            f"\u26a0\ufe0f [Adapter] Backend error for model `{model}`.\n\n"
+                            f"Error type: {err_type}\n"
+                            f"Error message: {err_text}\n\n"
+                            f"Try switching to another model."
+                        )
+                        self._anthro_sse("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {"type": "text_delta", "text": err_display},
+                        })
+                        self.wfile.flush()
+                        total_text += len(err_display)
+                        final_finish_reason = "end_turn"
+                        break
                     choices = cd.get("choices", [])
                     if not choices:
                         skip_count += 1
@@ -800,14 +896,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # ── 空回复检测 ──
         # 后端返回空内容时，注入可见警告，避免 Claude Desktop 静默卡住
         if total_text == 0 and len(tool_calls_acc) == 0:
-            warn_text = (
-                "\u26a0\ufe0f [Adapter] The backend model returned empty content.\n\n"
-                "Possible causes:\n"
-                "1. Conversation context too long, exceeding model context window\n"
-                "2. Model unable to process this request\n"
-                "3. Backend service temporary error\n\n"
-                "Suggestion: Start a new conversation window, or simplify the context and retry."
-            )
+            # 区分不同原因给出不同提示
+            if chunk_count == 0:
+                # curl 没收到任何 SSE 数据 → 后端超时或服务完全不可用
+                warn_text = (
+                    f"\u26a0\ufe0f [Adapter] Backend service unavailable for model `{model}`.\n\n"
+                    f"The backend did not return any data (0 chunks received).\n"
+                    f"This means the model service is down, overloaded, or timed out.\n\n"
+                    f"Try switching to: claude-sonnet-4-6, claude-opus-4-6, or gpt-5.2."
+                )
+                log(f"  !! NO DATA from backend (0 chunks): service unavailable for {model}")
+            else:
+                # 有数据但 content 为空 → 可能是上下文太长或模型异常
+                warn_text = (
+                    "\u26a0\ufe0f [Adapter] The backend model returned empty content.\n\n"
+                    "Possible causes:\n"
+                    "1. Conversation context too long, exceeding model context window\n"
+                    "2. Model unable to process this request\n"
+                    "3. Backend service temporary error\n\n"
+                    "Suggestion: Start a new conversation window, or simplify the context and retry."
+                )
+                log(f"  !! EMPTY REPLY detected: injected warning ({len(warn_text)} chars)")
+
+            # 注入警告文本为 SSE content_block
             self._anthro_sse("content_block_start", {
                 "type": "content_block_start",
                 "index": block_idx,
@@ -825,7 +936,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             })
             self.wfile.flush()
             total_text = len(warn_text)
-            log(f"  !! EMPTY REPLY detected: injected warning ({len(warn_text)} chars)")
 
         # message_delta + message_stop
         stop_map = {
